@@ -595,7 +595,15 @@ struct rdb_r_shard_visitor_t : public boost::static_visitor<bool> {
     }
 
     bool operator()(const intersecting_geo_read_t &gr) const {
-        return rangey_read(gr);
+        bool do_read = rangey_read(gr);
+        if (do_read) {
+            // RSI explain
+            auto *out = boost::get<intersecting_geo_read_t>(payload_out);
+            if (out->stamp) {
+                out->stamp->region = out->region;
+            }
+        }
+        return do_read;
     }
 
     bool operator()(const nearest_geo_read_t &gr) const {
@@ -1389,8 +1397,8 @@ RDB_IMPL_SERIALIZABLE_12_FOR_CLUSTER(
     terminal,
     sindex,
     sorting);
-RDB_IMPL_SERIALIZABLE_8_FOR_CLUSTER(
-        intersecting_geo_read_t, region, optargs, table_name, batchspec, transforms,
+RDB_IMPL_SERIALIZABLE_9_FOR_CLUSTER(
+        intersecting_geo_read_t, stamp, region, optargs, table_name, batchspec, transforms,
         terminal, sindex, query_geometry);
 RDB_IMPL_SERIALIZABLE_8_FOR_CLUSTER(
         nearest_geo_read_t, optargs, center, max_dist, max_results, geo_system,

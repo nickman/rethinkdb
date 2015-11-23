@@ -7,6 +7,16 @@
 #include "rdb_protocol/batching.hpp"
 #include "rdb_protocol/env.hpp"
 #include "rdb_protocol/func.hpp"
+#include "rdb_protocol/geo/geojson.hpp"
+#include "rdb_protocol/geo/geo_visitor.hpp"
+#include "rdb_protocol/geo/intersection.hpp"
+#include "rdb_protocol/geo/s2/s1angle.h"
+#include "rdb_protocol/geo/s2/s2edgeutil.h"
+#include "rdb_protocol/geo/s2/s2.h"
+#include "rdb_protocol/geo/s2/s2latlng.h"
+#include "rdb_protocol/geo/s2/s2latlngrect.h"
+#include "rdb_protocol/geo/s2/s2polygon.h"
+#include "rdb_protocol/geo/s2/s2polyline.h"
 #include "rdb_protocol/term.hpp"
 #include "rdb_protocol/val.hpp"
 #include "utils.hpp"
@@ -699,13 +709,71 @@ void intersecting_reader_t::accumulate_all(env_t *env, eager_acc_t *acc) {
     acc->add_res(env, &resp.result, sorting_t::UNORDERED);
 }
 
+class bounding_box_visitor_t : public s2_geo_visitor_t<geo::S2LatLngRect> {
+    geo::S2LatLngRect on_point(const geo::S2Point &pt) {
+        geo::S2EdgeUtil::RectBounder bounds;
+        bounds.AddPoint(&pt);
+        return expand(bounds.GetBound());
+    }
+
+    geo::S2LatLngRect on_line(const geo::S2Polyline &line) {
+        return from_region(line);
+    }
+
+    geo::S2LatLngRect on_polygon(const geo::S2Polygon &poly) {
+        return from_region(poly);
+    }
+
+    geo::S2LatLngRect from_region(const geo::S2Region &region) {
+        return expand(region.GetRectBound());
+    }
+
+    // We expand bounds by a small amount (1% plus a small constant) to account
+    // for floating point differences across different builds/machines.
+    geo::S2LatLngRect expand(const geo::S2LatLngRect &rect) {
+        geo::S2LatLng size = rect.GetSize();
+        geo::S1Angle lat_expansion = size.lat();
+        geo::S1Angle lng_expansion = size.lng();
+        lat_expansion *= 0.01;
+        lng_expansion *= 0.01;
+        lat_expansion += geo::S1Angle::Degrees(0.00001); // ~1 meter at equator
+        lng_expansion += geo::S1Angle::Degrees(0.00001);
+        geo::S2LatLng expansion(lat_expansion, lng_expansion);
+        geo::S2LatLngRect out = rect.Expanded(expansion);
+        debugf("expanded rect is %f x %f degrees\n", out.lat().GetLength(), out.lng().GetLength());
+        return out;
+    }
+};
+
 bool intersecting_reader_t::load_items(env_t *env, const batchspec_t &batchspec) {
     started = true;
     while (items_index >= items.size() && !shards_exhausted()) { // read some more
+        read_t read = readgen->next_read(
+                active_ranges, reql_version, stamp, transforms, batchspec);
+
+        intersecting_geo_read_t *gr = boost::get<intersecting_geo_read_t>(&read.read);
+        r_sanity_check(gr != nullptr);
+
+        boost::optional<datum_t> old_query_geometry;
+        if (gr->stamp) {
+            // RSI: explain
+            old_query_geometry = gr->query_geometry;
+
+            bounding_box_visitor_t visitor;
+            geo::S2LatLngRect bounding_box = visit_geojson(
+                    &visitor, gr->query_geometry);
+
+            lon_lat_line_t shell(4);
+            for (int i = 0; i < 4; i++) {
+                geo::S2LatLng point = bounding_box.GetVertex(i);
+                shell[i] = lon_lat_point_t(point.lng().degrees(), point.lat().degrees());
+            }
+
+            gr->query_geometry = construct_geo_polygon(shell, configured_limits_t());
+        }
+
         std::vector<rget_item_t> unfiltered_items = do_intersecting_read(
-            env,
-            readgen->next_read(
-                active_ranges, reql_version, stamp, transforms, batchspec));
+            env, std::move(read));
         if (unfiltered_items.empty()) {
             r_sanity_check(shards_exhausted());
         } else {
@@ -714,6 +782,13 @@ bool intersecting_reader_t::load_items(env_t *env, const batchspec_t &batchspec)
             items.reserve(unfiltered_items.size());
             for (size_t i = 0; i < unfiltered_items.size(); ++i) {
                 r_sanity_check(unfiltered_items[i].key.size() > 0);
+
+                if (old_query_geometry) {
+                    if (!geo_does_intersect(unfiltered_items[i].sindex_key, *old_query_geometry)) {
+                        continue;
+                    }
+                }
+
                 store_key_t pkey(ql::datum_t::extract_primary(unfiltered_items[i].key));
                 if (processed_pkeys.count(pkey) == 0) {
                     rcheck_toplevel(
@@ -736,6 +811,21 @@ std::vector<rget_item_t> intersecting_reader_t::do_intersecting_read(
     auto *gr = boost::get<intersecting_geo_read_t>(&read.read);
     r_sanity_check(gr);
     r_sanity_check(gr->sindex.region);
+
+    // RSI deduplicate logic
+    r_sanity_check(static_cast<bool>(stamp) == static_cast<bool>(gr->stamp));
+    if (stamp) {
+        r_sanity_check(res.stamp_response);
+        rcheck_datum(res.stamp_response->stamps, base_exc_t::RESUMABLE_OP_FAILED,
+                     "Unable to retrieve start stamps.  (Did you just reshard?)");
+        rcheck_datum(res.stamp_response->stamps->size() != 0,
+                     base_exc_t::RESUMABLE_OP_FAILED,
+                     "Empty start stamps.  Did you just reshard?");
+        for (const auto &pair : *res.stamp_response->stamps) {
+            // It's OK to blow away old values.
+            shard_stamps[pair.first] = pair.second;
+        }
+    }
 
     return unshard(sorting_t::UNORDERED, std::move(res));
 }
@@ -944,7 +1034,8 @@ changefeed::keyspec_t::range_t primary_readgen_t::get_range_spec(
         std::move(transforms),
         sindex_name(),
         sorting_,
-        datumspec};
+        datumspec,
+        boost::none};
 }
 
 sindex_readgen_t::sindex_readgen_t(
@@ -1045,7 +1136,7 @@ boost::optional<std::string> sindex_readgen_t::sindex_name() const {
 changefeed::keyspec_t::range_t sindex_readgen_t::get_range_spec(
         std::vector<transform_variant_t> transforms) const {
     return changefeed::keyspec_t::range_t{
-        std::move(transforms), sindex_name(), sorting_, datumspec};
+        std::move(transforms), sindex_name(), sorting_, datumspec, boost::none};
 }
 
 intersecting_readgen_t::intersecting_readgen_t(
@@ -1148,6 +1239,16 @@ key_range_t intersecting_readgen_t::original_keyrange(reql_version_t rv) const {
 
 boost::optional<std::string> intersecting_readgen_t::sindex_name() const {
     return sindex;
+}
+
+changefeed::keyspec_t::range_t intersecting_readgen_t::get_range_spec(
+        std::vector<transform_variant_t> transforms) const {
+    return changefeed::keyspec_t::range_t{
+        std::move(transforms),
+        sindex_name(),
+        sorting_t::UNORDERED,
+        datumspec_t(datum_range_t::universe()),
+        query_geometry};
 }
 
 bool datum_stream_t::add_stamp(changefeed_stamp_t) {
