@@ -2339,13 +2339,18 @@ public:
     }
     void operator()(const msg_t::change_t &change) const {
         datum_t null = datum_t::null();
+        debugf("msg_visitor_t(change)\n");
 
         feed->each_range_sub(*lock, [&](range_sub_t *sub) {
+            debugf("msg_visitor_t each range sub\n");
             datum_t new_val = null, old_val = null;
             if (!sub->active()) return;
             if (sub->has_ops()) {
+                debugf("msg_visitor_t sub has ops\n");
                 if (change.new_val.has()) {
+                    debugf("msg_visitor_t has new val\n");
                     if (boost::optional<datum_t> d = sub->apply_ops(change.new_val)) {
+                        debugf("msg_visitor_t filter returned datum\n");
                         new_val = *d;
                     }
                 }

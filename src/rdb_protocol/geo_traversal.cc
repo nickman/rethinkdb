@@ -231,6 +231,8 @@ continue_bool_t collect_all_geo_intersecting_cb_t::emit_result(
         THROWS_ONLY(interrupted_exc_t, ql::base_exc_t, geo_exception_t) {
     ql::groups_t data;
     data = {{ql::datum_t(), ql::datums_t{std::move(val)}}};
+    debugf("collect_all_geo_intersecting_cb_t::emit_result sindex_val is %s\n",
+            sindex_val.print().c_str());
 
     for (auto it = job.transformers.begin(); it != job.transformers.end(); ++it) {
         (**it)(job.env, &data, [&]() { return sindex_val; });

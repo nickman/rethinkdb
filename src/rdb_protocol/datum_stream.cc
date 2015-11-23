@@ -483,6 +483,7 @@ bool rget_response_reader_t::add_stamp(changefeed_stamp_t _stamp) {
 }
 
 boost::optional<active_state_t> rget_response_reader_t::truncate_and_get_active_state() {
+    debugf("stamp is %d, active_range is %d, shard_stamps.size is %d\n", static_cast<bool>(stamp), (bool)(active_ranges), (int)shard_stamps.size());
     if (!stamp || !active_ranges || shard_stamps.size() == 0) return boost::none;
     return active_state_t{
         key_range_t(key_range_t::closed, last_read_start,
@@ -784,6 +785,7 @@ bool intersecting_reader_t::load_items(env_t *env, const batchspec_t &batchspec)
                 r_sanity_check(unfiltered_items[i].key.size() > 0);
 
                 if (old_query_geometry) {
+                    debugf("sindex_key is %s\n", unfiltered_items[i].sindex_key.print().c_str());
                     if (!geo_does_intersect(unfiltered_items[i].sindex_key, *old_query_geometry)) {
                         continue;
                     }

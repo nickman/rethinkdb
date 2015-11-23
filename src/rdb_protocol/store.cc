@@ -365,15 +365,19 @@ struct rdb_read_visitor_t : public boost::static_visitor<void> {
 
     changefeed_stamp_response_t do_stamp(const changefeed_stamp_t &s) {
         auto cserver = store->changefeed_server(s.region);
+        debugf("do_stamp\n");
         if (cserver.first != nullptr) {
+            debugf("do_stamp got server\n");
             if (boost::optional<uint64_t> stamp
                     = cserver.first->get_stamp(s.addr, cserver.second)) {
+                debugf("do_stamp found stamp\n");
                 changefeed_stamp_response_t out;
                 out.stamps = std::map<uuid_u, uint64_t>();
                 (*out.stamps)[cserver.first->get_uuid()] = *stamp;
                 return out;
             }
         }
+        debugf("do_stamp falling to empty response\n");
         return changefeed_stamp_response_t();
     }
 
@@ -419,12 +423,16 @@ struct rdb_read_visitor_t : public boost::static_visitor<void> {
         rget_read_response_t *res =
             boost::get<rget_read_response_t>(&response->response);
 
+        debugf("marker outer\n");
         if (geo_read.stamp) {
+            debugf("inside stamp\n");
             res->stamp_response = changefeed_stamp_response_t();
             changefeed_stamp_response_t r = do_stamp(*geo_read.stamp);
             if (r.stamps) {
+                debugf("got stamps\n");
                 res->stamp_response = r;
             } else {
+                debugf("aborting for stamps\n");
                 res->result = ql::exc_t(
                     ql::base_exc_t::OP_FAILED,
                     "Feed aborted before initial values were read.",
